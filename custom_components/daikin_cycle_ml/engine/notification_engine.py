@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ..const import (
+    ALERT_DEDUP_DEFAULTS,
     ALERT_DEDUP_OPTION_PREFIX,
     ALERT_DEDUP_OPTION_SUFFIX,
     ALERT_GROUP_MAP,
@@ -296,6 +297,7 @@ def evaluate_alerts(
     boiler_active: bool = False,
     hp_running: bool = True,
     boiler_dhw_active: bool = False,
+    full_model: str = "",
 ) -> list[AlertSpec]:
     """Return alerts to dispatch now.
 
@@ -337,7 +339,8 @@ def evaluate_alerts(
         if not passes_filters(alert_type, severity, options, now):
             continue
         _per_key = f"{ALERT_DEDUP_OPTION_PREFIX}{alert_type}{ALERT_DEDUP_OPTION_SUFFIX}"
-        _per_min = _opt_float(options, _per_key, agg_min)
+        _per_type_default = ALERT_DEDUP_DEFAULTS.get(alert_type, agg_min)
+        _per_min = _opt_float(options, _per_key, _per_type_default)
         prev = last_sent.get(alert_type)
         if isinstance(prev, (int, float)) and (now - float(prev)) < _per_min * 60.0:
             _LOGGER.debug(
@@ -350,6 +353,7 @@ def evaluate_alerts(
         msg = build_rich_alert(
             bkey, severity, ctx or {},
             language=_lang, emoji_enabled=emoji_enabled,
+            full_model=full_model,
         )
         emitted[alert_type] = AlertSpec(
             alert_type=alert_type,
@@ -368,11 +372,13 @@ def build_status_message(
     context: Mapping[str, Any] | None = None,
     emoji_enabled: bool = True,
     language: str | None = None,
+    full_model: str = "",
 ) -> str:
     """Rich sectioned status report (Batch 37)."""
     lang = language or (context.get('language') if context else None) or 'en'
     return build_status_report(
-        snapshot, language=lang, emoji_enabled=bool(emoji_enabled)
+        snapshot, language=lang, emoji_enabled=bool(emoji_enabled),
+        full_model=full_model,
     )
 
 
@@ -380,10 +386,12 @@ def build_stooklijn_message(
     cache: Mapping[str, Any],
     language: str | None = None,
     emoji_enabled: bool = True,
+    full_model: str = "",
 ) -> str:
     """Bilingual stooklijn report (Batch 37)."""
     return build_stooklijn_report(
-        cache, language=(language or 'en'), emoji_enabled=bool(emoji_enabled)
+        cache, language=(language or 'en'), emoji_enabled=bool(emoji_enabled),
+        full_model=full_model,
     )
 
 
@@ -392,10 +400,12 @@ def build_cop_low_message(
     samples: int,
     language: str | None = None,
     emoji_enabled: bool = True,
+    full_model: str = "",
 ) -> str:
     """Bilingual low-COP report (Batch 37)."""
     return build_cop_low_report(
-        cop, samples, language=(language or 'en'), emoji_enabled=bool(emoji_enabled)
+        cop, samples, language=(language or 'en'), emoji_enabled=bool(emoji_enabled),
+        full_model=full_model,
     )
 
 async def async_send_notification(
