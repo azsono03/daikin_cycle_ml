@@ -96,7 +96,47 @@ def _is_short_run(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
     dur = last.get("duration_s")
     if not isinstance(dur, (int, float)):
         return False
+    # v1.19.7 #259: a stale cycle (end_ts > 1h ago) is not a live
+    # short-run. Prevents false positives after HA restart when the
+    # store hydrates a cycle from a previous day/session.
+    end_ts = last.get("end_ts")
+    if isinstance(end_ts, (int, float)) and (_now() - end_ts) > 3600.0:
+        return False
     return float(dur) < int(c.options.get("short_run_threshold_min", 20)) * 60
+
+
+def _is_short_cycling_pattern(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
+    """v1.19.7 #11: 3+ short runs within window = structural cycling pattern."""
+    try:
+        mc = int(c.options.get("short_cycling_min_cycles", 3))
+        wm = int(c.options.get("short_cycling_window_min", 60))
+        thr = int(c.options.get("short_run_threshold_min", 20)) * 60
+        n = c.store.count_short_in_window_mode(_now(), wm * 60, thr, MODE_HEATING)
+        return int(n) >= mc
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
+def _short_cycling_pattern_attrs(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> dict[str, Any] | None:
+    """v1.19.7 #11: diagnostic attributes for the short_cycling_pattern sensor."""
+    try:
+        wm = int(c.options.get("short_cycling_window_min", 60))
+        mc = int(c.options.get("short_cycling_min_cycles", 3))
+        thr_min = int(c.options.get("short_run_threshold_min", 20))
+        now = _now()
+        n = int(c.store.count_short_in_window_mode(
+            now, wm * 60, thr_min * 60, MODE_HEATING))
+        recent = c.store.short_runs_in_window_mode(
+            now, wm * 60, thr_min * 60, MODE_HEATING, limit=10)
+        return {
+            "window_min": wm,
+            "min_cycles_threshold": mc,
+            "short_run_threshold_min": thr_min,
+            "pattern_count_60min": n,
+            "recent_short_runs": recent,
+        }
+    except (TypeError, ValueError, AttributeError):
+        return None
 
 
 def _is_short_off(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
@@ -104,6 +144,10 @@ def _is_short_off(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
     # v1.19.6 FASE 5B: guard against corrupt non-dict last_cycle.
     last = c.store.last_cycle()
     if last and not isinstance(last, dict):
+        return False
+    # v1.19.7: pump-only LWT pulses are not real off-times. Skip transient
+    # predecessor -- same principle as #246 (short_run) and v1.19.6 (#257).
+    if last and _is_transient_int(last.get("is_transient")):
         return False
     if last and str(last.get("mode", "")).strip().lower() == "dhw":
         return False
@@ -116,7 +160,28 @@ def _is_short_off(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
     off = (last or {}).get("off_s")
     if not isinstance(off, (int, float)):
         return False
-    return off < int(c.options.get("short_off_threshold_min", 5)) * 60
+    # v1.19.7 #259: a stale cycle (end_ts > 1h ago) is not a live off-time.
+    end_ts_off = (last or {}).get("end_ts")
+    if isinstance(end_ts_off, (int, float)) and (_now() - end_ts_off) > 3600.0:
+        return False
+    threshold = int(c.options.get("short_off_threshold_min", 5)) * 60
+    if off >= threshold:
+        return False
+    # v1.19.7 fix #10: short_off requires at least one short run in the pair.
+    # A short gap between two long runs (e.g. 264min -> 60s -> 84min) is
+    # normal hysteresis restart, not short-cycling. Short-cycling is
+    # short-run -> short-off -> short-run.
+    cycles = c.store.cycles()
+    if len(cycles) < 2:
+        return True  # no prev cycle to compare, preserve old behavior
+    prev_max_s = int(c.options.get("short_run_threshold_min", 20)) * 60
+    # (last or {}) idiom: mypy can't prove `last` is not None here even
+    # though the off_s check above guarantees it. Behavior identical.
+    last_dur = (last or {}).get("duration_s")
+    prev_dur = cycles[-2].get("duration_s")
+    last_is_short = isinstance(last_dur, (int, float)) and last_dur < prev_max_s
+    prev_is_short = isinstance(prev_dur, (int, float)) and prev_dur < prev_max_s
+    return bool(last_is_short or prev_is_short)
 
 
 def _is_source_stale(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
@@ -263,6 +328,11 @@ BINARY_SENSOR_DEFS: list[dict[str, Any]] = [
      "device_class": BinarySensorDeviceClass.PROBLEM,
      "icon": "mdi:timer-alert-outline",
      "state_fn": _is_short_off},
+    {"key": "short_cycling_pattern", "name": "Short cycling pattern",
+     "device_class": BinarySensorDeviceClass.PROBLEM,
+     "icon": "mdi:repeat-variant",
+     "state_fn": _is_short_cycling_pattern,
+     "attr_fn": _short_cycling_pattern_attrs},
     {"key": "defrost_active", "name": "Defrost active",
      "device_class": BinarySensorDeviceClass.RUNNING,
      "state_fn": lambda s, c: _attr_on(s.attrs, ATTR_DEFROST_OPERATION)},

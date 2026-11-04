@@ -1908,12 +1908,24 @@ class CycleDB:
         Uses existing async_rollup_day logic.
         """
         conn = self._require()
+        # v1.19.7 #260: also rebuild days touched by cross-midnight
+        # cycles (both source and target) so pro-rata attribution
+        # applies to the full cycle.
         cur = await conn.execute(
-            "SELECT DISTINCT date(start_ts, 'unixepoch') AS d "
-            "FROM cycles "
-            "WHERE is_reconstructed = 1 "
-            "   OR mode_original IS NOT NULL "
-            "   OR is_dhw_tail = 1"
+            "SELECT DISTINCT day FROM ("
+            "  SELECT date(start_ts, 'unixepoch') AS day FROM cycles "
+            "  WHERE is_reconstructed = 1 "
+            "     OR mode_original IS NOT NULL "
+            "     OR is_dhw_tail = 1 "
+            "  UNION "
+            "  SELECT date(start_ts, 'unixepoch') AS day FROM cycles "
+            "  WHERE end_ts IS NOT NULL "
+            "    AND date(start_ts, 'unixepoch') != date(end_ts, 'unixepoch') "
+            "  UNION "
+            "  SELECT date(end_ts, 'unixepoch') AS day FROM cycles "
+            "  WHERE end_ts IS NOT NULL "
+            "    AND date(start_ts, 'unixepoch') != date(end_ts, 'unixepoch') "
+            ")"
         )
         try:
             days = [r[0] for r in await cur.fetchall() if r[0]]
@@ -1934,6 +1946,92 @@ class CycleDB:
                     "v18 R448 rebuild failed for day=%s", day
                 )
         return len(days)
+
+    async def async_migrate_to_v26(self) -> dict[str, Any]:
+        """v1.19.7 #12: null thermal_kw_avg for short cycles (<90s)."""
+        m = await self.async_get_model_state("data_migration_v26_completed")
+        if m and isinstance(m, dict) and m.get("completed"):
+            return {"nulled_short_cycles": 0, "completed": True}
+        conn = self._require()
+        cur = await conn.execute(
+            "UPDATE cycles SET thermal_kw_avg = NULL "
+            "WHERE duration_s < 90 AND thermal_kw_avg IS NOT NULL"
+        )
+        await conn.commit()
+        n = cur.rowcount or 0
+        await cur.close()
+        await self.async_set_model_state(
+            "data_migration_v26_completed",
+            {"completed": True, "nulled_short_cycles": n},
+        )
+        return {"nulled_short_cycles": n, "completed": True}
+
+
+    async def async_migrate_to_v27(self) -> dict[str, Any]:
+        """v1.19.7 #260/#261: fix overlapping cycle pairs + rebuild summaries.
+
+        Idempotent via data_migration_v27_completed marker.
+        """
+        marker = await self.async_get_model_state(
+            "data_migration_v27_completed"
+        )
+        if marker and isinstance(marker, dict) and marker.get("completed"):
+            return {"skipped": 1}
+
+        conn = self._require()
+        cur = await conn.execute(
+            "SELECT a.id, a.start_ts, a.end_ts, b.start_ts "
+            "FROM cycles a "
+            "JOIN cycles b ON b.start_ts > a.start_ts "
+            "  AND b.start_ts < a.end_ts "
+            "WHERE a.end_ts IS NOT NULL "
+            "  AND (a.parent_cycle_id IS NULL OR a.parent_cycle_id = 0) "
+            "  AND (b.parent_cycle_id IS NULL OR b.parent_cycle_id = 0) "
+            "ORDER BY a.start_ts ASC"
+        )
+        try:
+            overlaps = await cur.fetchall()
+        finally:
+            await cur.close()
+
+        fixed = 0
+        affected_days: set[str] = set()
+        for a_id, a_start, a_end, b_start in overlaps:
+            new_dur = int(b_start - a_start)
+            if new_dur <= 0:  # pragma: no cover — query guarantees > 0
+                continue
+            await conn.execute(
+                "UPDATE cycles SET end_ts = ?, duration_s = ? WHERE id = ?",
+                (float(b_start), new_dur, int(a_id)),
+            )
+            fixed += 1
+            for ts in (a_start, a_end, b_start):
+                affected_days.add(
+                    time.strftime("%Y-%m-%d", time.localtime(float(ts)))
+                )
+        await conn.commit()
+
+        for day in affected_days:
+            try:
+                await self.async_rollup_day(day)
+            except Exception:
+                _LOGGER.exception("v27 rollup failed for day=%s", day)
+
+        try:
+            await self._rebuild_daily_summary_for_affected_days()
+        except Exception:
+            _LOGGER.exception("v27 rebuild affected days failed")
+
+        stats = {
+            "overlap_fixed": fixed,
+            "days_rebuilt": len(affected_days),
+            "completed": True,
+        }
+        await self.async_set_model_state(
+            "data_migration_v27_completed", stats
+        )
+        return stats
+
 
     async def async_migrate_cop_samples_mode_default_v15(self) -> int:
         # v1.6.5 R298: NULL mode -> 'unknown'. Idempotent.
@@ -2051,12 +2149,16 @@ class CycleDB:
         except (ValueError, TypeError):
             return 0
         end_ts = start_ts + 86400.0
+        # v1.19.7 #260: overlap query — include cycles whose active
+        # window intersects [start_ts, end_ts). Pre-fix used `end_ts
+        # within day`, attributing cross-midnight cycles fully to the
+        # end-day (e.g. 16h run counted 100% on Oct 27).
         sql = (
-            "SELECT end_ts, duration_s, mode, dT_max, rps_avg, quality_score, "
-            "buh_used, defrost_used FROM cycles "
-            "WHERE end_ts IS NOT NULL AND end_ts >= ? AND end_ts < ?"
+            "SELECT start_ts, end_ts, duration_s, mode, dT_max, rps_avg, "
+            "quality_score, buh_used, defrost_used FROM cycles "
+            "WHERE end_ts IS NOT NULL AND start_ts < ? AND end_ts > ?"
         )
-        params: list[Any] = [start_ts, end_ts]
+        params: list[Any] = [end_ts, start_ts]
         if modes:
             sql += " AND COALESCE(mode,'unknown') IN ("
             sql += ",".join("?" * len(modes)) + ")"
@@ -2076,8 +2178,18 @@ class CycleDB:
             })
             a["cycles"] += 1
             dur = r["duration_s"]
+            # v1.19.7 #260: pro-rata attribution. Cross-midnight cycle
+            # contributes only its overlap with this day to
+            # total_duration_s. duration_min/max stay full-cycle stats
+            # (they describe the run, not the day-slice).
+            c_start = r["start_ts"]
+            c_end = r["end_ts"]
+            # v1.19.7 #260: query guarantees end_ts IS NOT NULL and the
+            # schema enforces start_ts NOT NULL, so both are always numeric.
+            ov_start = max(float(c_start), start_ts)
+            ov_end = min(float(c_end), end_ts)
+            a["total_duration_s"] += int(max(0.0, ov_end - ov_start))
             if isinstance(dur, (int, float)):
-                a["total_duration_s"] += int(dur)
                 if a["duration_min"] is None or dur < a["duration_min"]:
                     a["duration_min"] = int(dur)
                 if a["duration_max"] is None or dur > a["duration_max"]:

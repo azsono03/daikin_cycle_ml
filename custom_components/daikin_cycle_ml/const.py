@@ -3,7 +3,7 @@ from __future__ import annotations
 
 DOMAIN = "daikin_cycle_ml"
 NAME = "Daikin Cycle ML"
-VERSION = "1.19.6"
+VERSION = "1.19.7"
 
 # --- Coordinator ---
 UPDATE_INTERVAL_SECONDS = 30
@@ -21,6 +21,7 @@ MAX_CYCLE_DURATION_S = 48 * 3600.0
 MIN_SAMPLES_FOR_AVG = 3
 MAX_COP = 11.0
 MAX_THERMAL_KW = 14.0
+MIN_THERMAL_SAMPLES = 3  # v1.19.7 #12
 """Absolute maximum cycle duration before forced close (R315)."""
 ENERGY_DT_WARN_S = 60.0
 ENERGY_PERSIST_INTERVAL_S = 30.0
@@ -46,6 +47,8 @@ DEFAULT_MAX_CYCLE_DURATION_MIN = int(MAX_CYCLE_DURATION_S // 60)
 # --- Defaults: pendulum thresholds ---
 DEFAULT_SHORT_RUN_MIN = 20
 DEFAULT_SHORT_OFF_MIN = 5
+DEFAULT_SHORT_CYCLING_WINDOW_MIN = 60
+DEFAULT_SHORT_CYCLING_MIN_CYCLES = 3
 DEFAULT_SHORT_CYCLE_RATIO = 50
 DEFAULT_PENDULUM_CPH = 4
 DEFAULT_PENDULUM_CPD = 40
@@ -270,6 +273,7 @@ MODEL_LABELS = {
 }
 
 # --- Core attribute keys (fixed set, not user-selectable) ---
+ATTR_COP = "COP"
 ATTR_INV_FREQUENCY_RPS = "INV frequency (rps)"
 ATTR_INV_FREQUENCY_2_RPS = "INV frequency 2 (rps)"
 ATTR_OPERATION_MODE = "Operation Mode"
@@ -349,6 +353,7 @@ NOTIF_ID_PENDULUM_HOURLY = f"{DOMAIN}_pendulum_hourly"
 NOTIF_ID_PENDULUM_DAILY = f"{DOMAIN}_pendulum_daily"
 NOTIF_ID_SHORT_RUN = f"{DOMAIN}_short_run"
 NOTIF_ID_SHORT_OFF = f"{DOMAIN}_short_off"
+NOTIF_ID_SHORT_CYCLING_PATTERN = f"{DOMAIN}_short_cycling_pattern"
 NOTIF_ID_ML_ANOMALY = f"{DOMAIN}_ml_anomaly"
 NOTIF_ID_SETPOINT_OSC = f"{DOMAIN}_setpoint_osc"
 NOTIF_ID_COP_DEGRADATION = f"{DOMAIN}_cop_degradation"
@@ -414,6 +419,7 @@ ALERT_TYPE_EMOJI = {
     "db_retention_warning": "\U0001F5C4\uFE0F",
     "kmeans_retrain_stale": "\u2699\uFE0F",
     "energy_daily_anomaly": "\u26A1\uFE0F",
+    "short_cycling_pattern": "🔄",
 }
 
 # Status update (periodic summary) - opt-in, default off
@@ -542,6 +548,7 @@ ALERT_GROUP_MAP = {
     "dhw_pendulum": ALERT_GROUP_PENDULUM,
     "high_cycle_rate": ALERT_GROUP_SHORT_CYCLE,
     "cop_vs_datasheet_low": ALERT_GROUP_COP_STOOKLIJN,
+    "short_cycling_pattern": "short_cycle",
 }
 
 # Alert thresholds (PR C: unify magic numbers)
@@ -659,6 +666,7 @@ ALERT_DEDUP_DEFAULTS: dict[str, int] = {
     "db_retention_warning": 1440,
     "kmeans_retrain_stale": 1440,
     "energy_daily_anomaly": 1440,
+    "short_cycling_pattern": 60,
 }
 
 

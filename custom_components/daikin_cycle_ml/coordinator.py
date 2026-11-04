@@ -64,6 +64,7 @@ from .const import (
     MAX_COP,
     MIN_SAMPLES_FOR_AVG,
     MODE_DHW,
+    MODE_HEATING,
     MODEL_BASISPROFIEL,
     OPTION_DAILY_SUMMARY_LIVE_ENABLED,
     SOURCE_SENSOR_ENTITY,
@@ -141,7 +142,7 @@ from .ml.clustering import classify_clusters, nearest_centroid
 from .ml.features import VECTOR_LEN, extract_feature_vector
 from .ml.multi_baseline import MultiBaseline
 from .repairs import async_check_repairs
-from .storage.store import CycleStore
+from .storage.store import CycleStore, _is_transient_int
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -2266,10 +2267,19 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         if not isinstance(end_ts, (int, float)):
             return
         try:
-            day = time.strftime(
+            end_day = time.strftime(
                 "%Y-%m-%d", time.localtime(float(end_ts))
             )
-            await self.db.async_rollup_day(day)
+            await self.db.async_rollup_day(end_day)
+            # v1.19.7 #260: cross-midnight — rollup start_day too so the
+            # pro-rata attribution applies to both source and target day.
+            start_ts = record.get("start_ts")
+            if isinstance(start_ts, (int, float)):
+                start_day = time.strftime(
+                    "%Y-%m-%d", time.localtime(float(start_ts))
+                )
+                if start_day != end_day:
+                    await self.db.async_rollup_day(start_day)
         except Exception:
             _LOGGER.exception("live daily rollup failed")
             return
@@ -3618,15 +3628,56 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         last = self.store.last_cycle()
         dur = (last or {}).get("duration_s")
         # #246: skip transient pump-only LWT sampling pulses
+        # v1.19.7 #259: a stale cycle (end_ts > 1h ago) is not a live short-run
+        _run_stale = False
+        _run_end_ts = (last or {}).get("end_ts")
+        if isinstance(_run_end_ts, (int, float)) and (now - _run_end_ts) > 3600.0:
+            _run_stale = True
         is_short_run = (
             isinstance(dur, (int, float))
-            and not (last or {}).get("is_transient")
+            and not _is_transient_int((last or {}).get("is_transient"))
+            and not _run_stale
             and dur < short_run_th
         )
         # #245: completed gap from last cycle record, not live off-time
-        off = (last or {}).get("off_s")
-        is_short_off = isinstance(off, (int, float)) and off < short_off_th
-        is_pend_h = self.store.cycles_in_window(now, 3600) >= pend_hour
+        # v1.19.7: mirror binary_sensor._is_short_off (transient skip)
+        if last and _is_transient_int(last.get("is_transient")):
+            is_short_off = False
+        else:
+            off = (last or {}).get("off_s")
+            _off_stale = False
+            _off_end_ts = (last or {}).get("end_ts")
+            if isinstance(_off_end_ts, (int, float)) and (now - _off_end_ts) > 3600.0:
+                _off_stale = True
+            if _off_stale or not isinstance(off, (int, float)) or off >= short_off_th:
+                is_short_off = False
+            else:
+                # v1.19.7 fix #10: require at least one short run in the pair
+                _cycles = self.store.cycles()
+                if len(_cycles) < 2:
+                    is_short_off = True
+                else:
+                    _prev_max_s = int(self.options.get("short_run_threshold_min", 20)) * 60
+                    # (last or {}) idiom: mypy can't prove `last` is not None
+                    # here even though the off_s check above guarantees it.
+                    _last_dur = (last or {}).get("duration_s")
+                    _prev_dur = _cycles[-2].get("duration_s")
+                    _last_short = isinstance(_last_dur, (int, float)) and _last_dur < _prev_max_s
+                    _prev_short = isinstance(_prev_dur, (int, float)) and _prev_dur < _prev_max_s
+                    is_short_off = bool(_last_short or _prev_short)
+        # v1.19.6 scope A: HEATING-only (mirror binary_sensor._is_pendulum_hourly)
+        is_pend_h = (
+            self.store.cycles_in_window_mode(now, 3600, MODE_HEATING) >= pend_hour
+        )
+        # v1.19.7 #11: short cycling pattern (mirror _is_short_cycling_pattern)
+        _sc_mc = int(self.options.get("short_cycling_min_cycles", 3))
+        _sc_wm = int(self.options.get("short_cycling_window_min", 60))
+        _sc_thr = int(self.options.get("short_run_threshold_min", 20)) * 60
+        _sc_n = 0
+        with contextlib.suppress(TypeError, ValueError, AttributeError):
+            _sc_n = int(self.store.count_short_in_window_mode(
+                now, _sc_wm * 60, _sc_thr, MODE_HEATING))
+        is_short_cycling_pattern = _sc_n >= _sc_mc
         is_pend_d = (
             len(self.store.non_transient_today(now)) >= pend_day
         )
@@ -3681,6 +3732,7 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         )
         return {
             "short_run": bool(is_short_run),
+            "short_cycling_pattern": bool(is_short_cycling_pattern),
             "short_off": bool(is_short_off),
             "pendulum_hourly": bool(is_pend_h),
             "pendulum_daily": bool(is_pend_d),
@@ -4134,6 +4186,14 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 "indoor": _f(in_t), "flow": _f(flow),
                 "outdoor": _f(out_t), "advice": advice_text,
             },
+            "short_cycling_pattern": {
+                "min_cycles": opts.get("short_cycling_min_cycles", 3),
+                "window_min": opts.get("short_cycling_window_min", 60),
+                "threshold_min": opts.get("short_run_threshold_min", 20),
+                "mode": mode_str,
+                "outdoor": _f(out_t),
+                "advice": advice_text,
+            },
             "ml_anomaly": {
                 "mode": mode_str, "z_max": None, "top_dim": None,
                 "last_duration_min": avg_dur,
@@ -4518,6 +4578,21 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 await self._emit_alert(alert)
                 self._last_alert_sent[alert.alert_type] = now
                 self._schedule_alert_save()
+                # v1.19.7 fix #14: persist alert to DB (was dead code)
+                _db = getattr(self, "db", None)
+                if _db is not None:
+                    try:
+                        await _db.async_insert_alert(
+                            alert_type=alert.alert_type,
+                            severity=alert.severity,
+                            message=alert.message,
+                            ts=now,
+                        )
+                    except Exception:
+                        _LOGGER.debug(
+                            "alert DB persist failed: %s",
+                            alert.alert_type, exc_info=True,
+                        )
         except Exception:
             _LOGGER.exception("Alert dispatch failed")
 
