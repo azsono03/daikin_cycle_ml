@@ -2,6 +2,77 @@
 
 ## [Unreleased]
 
+### Added
+
+- **`sensor.alerts_today`:** new sensor exposing today's alert count and
+  full-day alert list. State = total count since local midnight.
+  Attributes: `since` (ISO), `total`, `by_type`, `by_severity`, `alerts[]`
+  (max 30, newest first, each with time/type/severity/message/count),
+  `truncated` (>30 alerts). Cache refresh throttled 60s; dirty-flag
+  forces immediate refresh after each alert fires. Reads from existing
+  `alerts` DB table (no schema change). User-facing surface for the
+  alerts table which was write-only since v1.19.7. Adds 12 regression
+  tests.
+
+### Changed
+
+- **`source_stale` threshold 60s -> 120s:** raised `SOURCE_STALE_FACTOR`
+  from 2.0 to 4.0 to tolerate a single missed tick. Reduces false-positive
+  `source_stale` alerts (severity `critical`, bypasses quiet hours) on
+  healthy sources where a transient `hass.states.get()` miss triggers at
+  age 62.5s while the actual source cadence is 30.1s.
+
+- **Hybrid COP aggregation (issue #237):** `_maybe_refresh_cop_hourly`
+  now bypasses the `cop_hourly` rollup on hybrid (EVLQ) installs and
+  aggregates pure-HP `cop_samples` directly (`include_boiler=False`).
+  The rollup buckets by `(ts_hour, mode)` and has no `boiler_active`
+  dimension, so on co-fire days boiler-assisted samples would be mixed
+  with pure-HP samples in the same bucket, lowering `cop_mean_*` and
+  `cop_heating_*` / `cop_dhw_*` / `cop_cooling_*` sensor values. This
+  is a **latent** issue: on PROD-1 no boiler samples were recorded in
+  the last 7 days (1486 pure-HP samples, 0 co-fire), so current sensor
+  values are unaffected. The fix prevents distortion on future co-fire
+  days (cold snaps, defrost recovery, DHW peaks). Non-hybrid installs:
+  unchanged path, identical results.
+
+### Fixed
+
+- **`source_stale` false positive (prod-1, 2026-11-04 13:58:57):** alert
+  fired at age=62.5s vs threshold=60s. Recorder-proven source cadence was
+  30.1s with no gap; integration view was 2 beats stale from a single
+  missed `hass.states.get()` read -- not an actual source outage.
+  Regression tests added in `tests/test_v1198_source_stale_factor.py`.
+
+- **Hybrid COP sensors (issue #237):** latent bug. On hybrid installs,
+  `cop_mean_day/week/month`, `cop_heating_*`, `cop_dhw_*`,
+  `cop_cooling_*` sensors and their `by_mode` attributes now aggregate
+  from pure-HP `cop_samples` directly instead of the boiler-mixed
+  `cop_hourly` rollup. No user-visible change on installs without
+  co-fire events (verified: PROD-1 has 0 boiler samples in the last
+  7 days). Correction is automatic on first 300s refresh after upgrade
+  if co-fire samples exist. Regression tests added in
+  `tests/test_v1198_hybrid_cop_hourly_filter.py`.
+
+- **0-byte orphan DB cleanup on removal (issue #236):**
+  `async_remove_entry` now calls `_async_cleanup_orphan_dbs` in a
+  `finally` block. Pre-v1.10.0 orphan `daikin_cycle_ml_*.db` files are
+  cleaned up on integration setup (existing behavior) and now also on
+  permanent entry removal. Non-zero DBs, `.legacy-*` and backup files
+  untouched. WAL-sidecar guard (`.db-wal` > 0 or `.db-shm` present)
+  ensures active databases are never deleted. Adds 3 regression tests
+  in `tests/test_v1198_orphan_cleanup_on_remove.py`.
+
+- **Diagnostics crash on non-SQLite DB files:**
+  `_count_tables_sync` caught `sqlite3.OperationalError` but "file is
+  not a database" raises `sqlite3.DatabaseError` (parent class). A
+  stray 0-byte or corrupt `daikin_cycle_ml_*.db` file matching the
+  filename pattern could crash `async_get_config_entry_diagnostics`.
+  Pre-existing since diagnostics was added; surfaced by the #236
+  cleanup no longer leaving a valid placeholder behind. Change
+  `except OperationalError` -> `except DatabaseError` (still catches
+  all prior cases). Adds 2 regression tests in
+  `tests/test_v1198_diagnostics_db_guard.py`.
+
 ## [1.19.7] - 2026-11-04
 
 ### Fixed

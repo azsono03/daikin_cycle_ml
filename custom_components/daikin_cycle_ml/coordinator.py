@@ -147,6 +147,7 @@ from .storage.store import CycleStore, _is_transient_int
 _LOGGER = logging.getLogger(__name__)
 
 _KMEANS_STALE_THRESHOLD_S = 25 * 3600
+_ALERTS_TODAY_MAX = 30  # cap on alert list in sensor attrs
 _KMEANS_BACKFILL_DELAY_S = 300
 
 
@@ -188,6 +189,7 @@ class DataSnapshot:
     cop_degradation_status: str = "none"
     cop_degradation_week_pct: float | None = None
     cop_trend_30d: float | None = None
+    alerts_today: dict[str, Any] = field(default_factory=dict)
     cop_degradation_detail: dict[str, Any] = field(default_factory=dict)
     cop_trend_detail: dict[str, Any] = field(default_factory=dict)
     # Hybrid (EVLQ) support — issue #218
@@ -572,6 +574,9 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         self._stooklijn_cache_ts: float = 0.0
         self._cop_today_cache: dict[str, Any] = {}
         self._cop_today_heating_cache: dict[str, Any] = {}
+        self._alerts_today_cache: dict[str, Any] = {}
+        self._alerts_today_cache_ts: float = 0.0
+        self._alerts_today_dirty: bool = False
         self._cop_hourly_cache: dict[str, dict[str, Any]] = {}
         self._spf_state_cache: dict[str, Any] = {}
         self._datasheet_cache: dict[str, Any] = {}
@@ -850,6 +855,51 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         )
         return result
 
+    @staticmethod
+    def _aggregate_cop_rows(
+        rows: list[dict[str, Any]], *, since_ts: float,
+    ) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+        """v1.19.8 #237: aggregate pure-HP cop_samples for hybrid."""
+        def _valid(r: Any) -> bool:
+            if not isinstance(r, dict):
+                return False
+            ts = r.get("ts")
+            cop = r.get("cop")
+            if not isinstance(ts, (int, float)) or float(ts) < since_ts:
+                return False
+            return isinstance(cop, (int, float)) and float(cop) > 0.0
+
+        def _stats(subset: list[dict[str, Any]]) -> dict[str, Any]:
+            if not subset:
+                return {
+                    "n_hours": 0, "n_samples": 0,
+                    "cop_mean": None, "cop_p10": None, "cop_p90": None,
+                    "cop_min": None, "cop_max": None,
+                }
+            cops = sorted(float(r["cop"]) for r in subset)
+            n = len(cops)
+            hours = {int(float(r["ts"]) // 3600) for r in subset}
+            def _p(q: float) -> float:
+                return cops[min(int(n * q), n - 1)]
+            return {
+                "n_hours": len(hours),
+                "n_samples": n,
+                "cop_mean": sum(cops) / n,
+                "cop_p10": _p(0.10),
+                "cop_p90": _p(0.90),
+                "cop_min": cops[0],
+                "cop_max": cops[-1],
+            }
+
+        filtered = [r for r in rows if _valid(r)]
+        stats = _stats(filtered)
+        modes = sorted({r["mode"] for r in filtered if r.get("mode")})
+        by_mode = {
+            m: _stats([r for r in filtered if r.get("mode") == m])
+            for m in modes
+        }
+        return stats, by_mode
+
     async def _maybe_refresh_cop_hourly(self, now: float) -> None:
         """Refresh day/week/month cop_hourly caches (throttled 300s)."""
         if self.db is None:
@@ -857,16 +907,27 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         if (now - self._cop_hourly_cache_ts) < 300.0:
             return
         try:
+            is_hybrid = self._is_hybrid_install()
             for label, days in (
                 ("day", 1), ("week", 7), ("month", 30),
             ):
                 since = now - float(days) * 86400.0
-                stats = await self.db.async_cop_hourly_stats(
-                    since_ts=since
-                )
-                by_mode = await self.db.async_cop_hourly_by_mode(
-                    since_ts=since
-                )
+                if is_hybrid:
+                    # v1.19.8 #237: cop_hourly rollup mixes boiler+HP
+                    # in same bucket; bypass, aggregate pure-HP only.
+                    rows = await self.db.async_fetch_cop_samples(
+                        days=days, include_boiler=False,
+                    )
+                    stats, by_mode = DaikinCycleMLCoordinator._aggregate_cop_rows(
+                        rows, since_ts=since,
+                    )
+                else:
+                    stats = await self.db.async_cop_hourly_stats(
+                        since_ts=since
+                    )
+                    by_mode = await self.db.async_cop_hourly_by_mode(
+                        since_ts=since
+                    )
                 self._cop_hourly_cache[label] = {
                     **stats,
                     "by_mode": by_mode,
@@ -879,6 +940,59 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             await self._refresh_cop_curve_recent(now)
         except Exception:
             _LOGGER.exception("cop curve_recent refresh failed")
+
+    async def _refresh_alerts_today(self, now: float) -> None:
+        """Refresh alerts_today cache (throttled 60s, dirty bypasses)."""
+        if self.db is None:
+            return
+        if (not self._alerts_today_dirty
+                and (now - self._alerts_today_cache_ts) < 60.0):
+            return
+        try:
+            lt = time.localtime(now)
+            today_start = time.mktime(
+                (lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1)
+            )
+            total = await self.db.async_count_alerts_since(today_start)
+            rows = await self.db.async_fetch_alerts_since(
+                today_start, limit=_ALERTS_TODAY_MAX,
+            )
+            by_type: dict[str, int] = {}
+            by_severity: dict[str, int] = {}
+            alerts_out: list[dict[str, Any]] = []
+            for r in rows:
+                atype = r.get("alert_type") or "unknown"
+                sev = r.get("severity") or "unknown"
+                by_type[atype] = by_type.get(atype, 0) + 1
+                by_severity[sev] = by_severity.get(sev, 0) + 1
+                try:
+                    ts_iso = time.strftime(
+                        "%Y-%m-%dT%H:%M:%S",
+                        time.localtime(float(r.get("ts", 0))),
+                    )
+                except (ValueError, TypeError, OSError):
+                    ts_iso = None
+                alerts_out.append({
+                    "time": ts_iso,
+                    "type": atype,
+                    "severity": sev,
+                    "message": (r.get("message") or "")[:400],
+                    "count": int(r.get("aggregated_count") or 1),
+                })
+            self._alerts_today_cache = {
+                "since": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S", time.localtime(today_start)
+                ),
+                "total": int(total),
+                "by_type": by_type,
+                "by_severity": by_severity,
+                "alerts": alerts_out,
+                "truncated": int(total) > len(alerts_out),
+            }
+            self._alerts_today_cache_ts = now
+            self._alerts_today_dirty = False
+        except Exception:
+            _LOGGER.debug("alerts_today refresh failed", exc_info=True)
 
     async def _maybe_refresh_cop_degradation(self, now: float) -> None:
         """Refresh weather-normalized degradation + 30d trend (C4).
@@ -1488,6 +1602,7 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             await self._maybe_refresh_stooklijn(now)
             await self._maybe_refresh_cop_hourly(now)
             await self._maybe_refresh_cop_degradation(now)
+            await self._refresh_alerts_today(now)
             await self._maybe_refresh_spf(now)
             snap.cop_today = self._cop_today_heating_cache
             snap.cop_combined_today = self._cop_today_cache
@@ -1498,6 +1613,7 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             snap.cop_curve_recent = self._cop_hourly_cache.get(
                 "curve_recent", {}
             )
+            snap.alerts_today = self._alerts_today_cache
             _deg = self._cop_degradation_cache.get("degradation", {})
             _tr = self._cop_degradation_cache.get("trend", {})
             snap.cop_degradation_status = _deg.get("severity", "none")
@@ -4578,6 +4694,7 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 await self._emit_alert(alert)
                 self._last_alert_sent[alert.alert_type] = now
                 self._schedule_alert_save()
+                self._alerts_today_dirty = True
                 # v1.19.7 fix #14: persist alert to DB (was dead code)
                 _db = getattr(self, "db", None)
                 if _db is not None:
