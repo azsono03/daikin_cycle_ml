@@ -449,6 +449,21 @@ def _compute_daily_summary_recent(
     }
 
 
+def _as_opt_float(v: object) -> float | None:
+    """v1.19.9 R643: defensive cast to float|None.
+
+    Used by the classifier wire. Rejects bool (which isinstance-int would
+    accept as 1.0/0.0 silently) and non-numeric types. Returns None for
+    anything that isn't a real int/float, so caller can safely pass
+    classifier and let it decide not_applicable.
+    """
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    return None
+
+
 class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
     """Reads the source sensor every UPDATE_INTERVAL_SECONDS."""
 
@@ -570,6 +585,15 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         )
         self._last_cop_sample_ts: float = 0.0
         self._cop_sample_seed_done: bool = False
+        # v1.19.9 #122/#127-Q3: settle window tracking.
+        # _last_mode_change_ts = last non-unknown mode transition.
+        # 0.0 = bootstrap (allow samples immediately on cold start).
+        self._last_mode_change_ts: float = 0.0
+        self._last_observed_mode: str = ""
+        # v1.19.9 #123: daily reject-tracking for cop_physically_impossible.
+        self._cop_rejected_today_count: int = 0
+        self._cop_rejected_today_first_ts: float = 0.0
+        self._cop_rejected_day_key: str = ""
         self._stooklijn_cache: dict[str, Any] = {}
         self._stooklijn_cache_ts: float = 0.0
         self._cop_today_cache: dict[str, Any] = {}
@@ -1586,6 +1610,8 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 await self._process_new_cycle(record, snap)
             snap.state = self.detector.state
             snap.mode = self.detector.snapshot().get("mode", "unknown")
+            # v1.19.9 #122: track mode transitions for SETTLE_S gate.
+            self._track_mode_transition(snap, now)
             snap.cycle_start_ts = float(
                 self.detector.snapshot().get("start_ts") or 0.0
             )
@@ -1727,6 +1753,10 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         # that a failed restore in one subsystem cannot wipe the other.
         if self._runtime_day_key != day:
             self._runtime_day_key = day
+            # v1.19.9 #123: reset cop reject counter on day boundary.
+            self._cop_rejected_today_count = 0
+            self._cop_rejected_today_first_ts = 0.0
+            self._cop_rejected_day_key = day
             self._buh_step1_s = 0.0
             self._buh_step2_s = 0.0
             self._prev_defrost = False
@@ -3028,6 +3058,23 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 return cm
         return 'unknown'
 
+    def _track_mode_transition(self, snap: Any, now: float) -> None:
+        """v1.19.9 #122: track non-unknown mode transitions.
+
+        Extracted from _async_update_data for testability. Only
+        non-unknown -> different-non-unknown counts (idle is a pause,
+        not a mode switch). First observed mode also sets change_ts
+        (bootstrap cycle start = new cycle boundary).
+        """
+        _new_mode = getattr(snap, "mode", None)
+        if not isinstance(_new_mode, str):
+            return
+        if not _new_mode or _new_mode == "unknown":
+            return
+        if _new_mode != self._last_observed_mode:
+            self._last_mode_change_ts = now
+            self._last_observed_mode = _new_mode
+
     async def _maybe_collect_cop_sample(self, now: float) -> None:
         if self.db is None:
             return
@@ -3048,6 +3095,34 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         interval = 300.0
         if (now - self._last_cop_sample_ts) < interval:
             return
+        # v1.19.9 #122/#127-Q3: settle window after mode transition.
+        # Daikin compressor needs ~300s to reach steady-state after
+        # switching between heating and dhw. Samples within that window
+        # are transition artifacts (RFI #127 Q4 sample id=148 had
+        # cop=19.5 immediately post-mode-switch).
+        # R601: defensive access -- partial mocks in older tests don't
+        # set _last_mode_change_ts; treat missing/non-numeric as 0.0
+        # (bootstrap, allow sample).
+        _last_mc_raw = getattr(self, "_last_mode_change_ts", 0.0)
+        _last_mc: float = (
+            float(_last_mc_raw)
+            if isinstance(_last_mc_raw, (int, float))
+            and not isinstance(_last_mc_raw, bool)
+            else 0.0
+        )
+        if _last_mc > 0.0:
+            _opts = getattr(self, "options", None) or {}
+            _settle_s = float(
+                _opts.get("cop_settle_time_s", 300.0) or 300.0
+            )
+            _age = now - _last_mc
+            if _age < _settle_s:
+                _LOGGER.debug(
+                    "v1.19.9 #122: cop sample blocked by settle window "
+                    "(age=%.0fs < %.0fs)",
+                    _age, _settle_s,
+                )
+                return
         # v1.13.2 #196: source-driven COP sampling.
         # Old path read attrs from cop_sensor (a numeric template sensor
         # with no synthetic keys). Result: data_quality always 'unknown',
@@ -3184,6 +3259,42 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             'boiler_active': 1 if _ba else 0,
             'boiler_mode': _boiler_mode,
         }
+        # v1.19.9 #123: 3-tier Carnot classifier (RFI #127 Q1, factor 0.65).
+        # reject: physically impossible -> do not store.
+        # flag:   suspect -> store with is_transition_artifact=1.
+        # accept: normal operation -> store with flag=0.
+        # not_applicable: cooling / missing data / lwt<=outdoor -> store as-is.
+        from .engine.physics import classify_cop_sample
+
+        _cls = classify_cop_sample(
+            mode=str(_mode),
+            lwt=_as_opt_float(row.get('lwt')),
+            outdoor=_as_opt_float(row.get('outdoor')),
+            cop=_as_opt_float(row.get('cop')),
+        )
+        if _cls == 'reject':
+            _LOGGER.warning(
+                "v1.19.9 #123: rejected physically impossible COP=%s "
+                "(lwt=%s, outdoor=%s, mode=%s)",
+                row.get('cop'), row.get('lwt'), row.get('outdoor'),
+                str(_mode),
+            )
+            # v1.19.9 #123: track rejects for cop_physically_impossible alert.
+            # R601: defensive access -- partial mocks in older wire tests
+            # (test_v1199_cop_gate_wire) don't set these fields.
+            _cur = getattr(self, "_cop_rejected_today_count", 0)
+            if isinstance(_cur, int) and not isinstance(_cur, bool):
+                self._cop_rejected_today_count = _cur + 1
+            else:
+                self._cop_rejected_today_count = 1
+            _cur_ts = getattr(self, "_cop_rejected_today_first_ts", 0.0)
+            if not isinstance(_cur_ts, (int, float)) or isinstance(_cur_ts, bool):
+                _cur_ts = 0.0
+            if _cur_ts <= 0.0:
+                self._cop_rejected_today_first_ts = now
+            return
+        if _cls == 'flag':
+            row['is_transition_artifact'] = 1
         ok = await self.db.async_insert_cop_sample(row)
         if ok:
             self._last_cop_sample_ts = now
@@ -3832,9 +3943,14 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         ))
         _buh_7d_ratio = float(getattr(self, "_buh_7d_ratio", 0.0) or 0.0)
         is_buh_excessive = _buh_7d_ratio > _buh_thr
-        _last_ok = float(getattr(snap, "last_success_ts", 0.0) or 0.0)
-        _stale_thr = SOURCE_STALE_FACTOR * UPDATE_INTERVAL_SECONDS
-        is_source_stale = _last_ok > 0 and (now - _last_ok) > _stale_thr
+        # v1.19.9: single source of truth -- delegate to
+        # binary_sensor._is_source_stale so this path and the
+        # binary_sensor entity agree. Pre-fix both had duplicate
+        # tick-based logic that false-fired critical alerts on slow
+        # ticks (real prod 2026-11-05 hourly pattern).
+        from .binary_sensor import _is_source_stale as _is_src_stale_fn
+        is_source_stale = bool(_is_src_stale_fn(snap, self))
+        _ = SOURCE_STALE_FACTOR * UPDATE_INTERVAL_SECONDS  # keep import used
         is_missing_attributes = len(getattr(snap, "missing_attrs", []) or []) > 0
         # PR F: P2 alert triggers (v1.9.0)
         _dhw_cph = 0
@@ -3866,6 +3982,9 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             "defrost_excessive": bool(is_defrost_excessive),
             "buh_excessive": bool(is_buh_excessive),
             "source_stale": bool(is_source_stale),
+            "cop_physically_impossible": int(
+                getattr(self, "_cop_rejected_today_count", 0) or 0
+            ) > 0,
             "missing_attributes": bool(is_missing_attributes),
             "dhw_pendulum": bool(is_dhw_pendulum),
             "high_cycle_rate": bool(is_high_cycle_rate),
@@ -4340,6 +4459,13 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
                 "trend_30d": _f(getattr(snap, "cop_trend_30d", None)),
                 "mode": mode_str,
                 "outdoor": _f(out_t),
+                "advice": advice_text,
+            },
+            "cop_physically_impossible": {
+                "count": int(
+                    getattr(self, "_cop_rejected_today_count", 0) or 0
+                ),
+                "mode": mode_str,
                 "advice": advice_text,
             },
             "defrost_excessive": {

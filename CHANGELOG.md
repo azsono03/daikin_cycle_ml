@@ -2,6 +2,124 @@
 
 ## [Unreleased]
 
+### Added
+
+- **v28 migration — historical re-classification (Bug #10 fix, #123):**
+  After v1.19.9 per-insert classifier is active for new samples, this
+  migration re-classifies all existing `cop_samples` with the new
+  0.65 Carnot factor (was 0.55) and 1.5x reject threshold. Retroactively
+  fixes impossible samples that entered between pre-v1.19.9 migrations.
+
+  Effect on prod-1 2026-11-05 snapshot (5295 heating+dhw samples):
+    unflagged=50  (0.55 was too strict, samples restored to aggregates)
+    flagged=22    (0.65 catches more, now correctly marked)
+    rejected=1    (real 154.7% Carnot sample gets marker)
+
+  Net: -27 false flags. COP averages become more accurate. Idempotent
+  via `data_migration_v28_completed` marker. Runs once at first HA
+  restart after upgrade, after v27 migration completes.
+
+### Fixed
+
+- **3 alert-types missing group mapping (real prod gap, 2026-11-05):**
+  `db_retention_warning`, `energy_daily_anomaly`, and
+  `kmeans_retrain_stale` were present in `BINARY_ALERT_MAP` and fired
+  correctly, but were absent from `ALERT_GROUP_MAP`. Effect: their
+  notifications had no group, so UI sorting, grouping-with-related-
+  alerts, and dedup-grouping were silently broken for these 3 types.
+  Discovered by `test_alert_storm_grouping` (R645 simulation test).
+  Pre-existing since the alerts were introduced; fix is 3 entries in
+  `const.py`.
+
+- **Pre-v1.19.9 no per-insert classification (Bug #10, 2026-11-05):**
+  Historical snapshot analysis found 1 real physically-impossible
+  sample in prod-1 DB (`ts=1793613753 mode=dhw cop=19.29 lwt=34.8
+  out=10.1`, 154.7% of Carnot) with `is_transition_artifact=0`.
+  Root cause: pre-v1.19.9 `_flag_carnot_artifacts` only ran during
+  migrations (v25, v27), not on every insert. Any impossible sample
+  between migrations stayed unmarked. v1.19.9 fix: classifier runs
+  per-insert. v28 migration (phase 5) will retroactively re-flag
+  historical impossible samples.
+
+### Added
+
+- **SETTLE_S gate (#122, RFI #127 Q3):** COP samples taken within 300s
+  of a mode transition (heating <-> DHW) are now blocked. Real prod-1
+  evidence: RFI #127 Q4 sample id=148 had cop=19.5 immediately post
+  mode-switch -- well above Carnot ceiling. The 300s window matches
+  Daikin compressor ramp-time per RFI answer. Configurable via new
+  `cop_settle_time_s` option (default 300). Tracking: new
+  `_last_mode_change_ts` + `_last_observed_mode` fields updated on
+  every non-unknown mode transition in `_async_update_data`.
+
+- **dT >= 1.5K gate (#123, RFI #127 Q3):** `dt_from_attrs` now
+  rejects delta-T values below 1.5K in both the primary (R1T-R4T)
+  and fallback (R2T-R4T) paths. Pre-fix threshold was 0.5K; ESPAltherma
+  sensors have +/-0.3K tolerance, so below 1.5K the relative error on
+  COP calculation is >= 20%. Real prod-1 measurements: many samples at
+  dT=0.5-1.4K were being included with unreliable COP.
+
+- **3-tier Carnot COP classifier wired (#123, RFI #127 Q1):** every COP
+  sample now classified as `accept` (<= ceiling * 1.05), `flag`
+  (suspicious, stored with `is_transition_artifact=1`), or `reject`
+  (> 1.5x Carnot, physically impossible, not stored). Pre-fix the
+  classifier existed as a standalone primitive but was never called
+  from `_maybe_collect_cop_sample`. Real prod-1 evidence 2026-11-05:
+  4/148 samples classified (3 flag, 0 reject, 145 accept); the
+  borderline sample (cop=8.48 vs ceiling 8.46) preserved via the 1.05
+  sensor-noise margin. Alert wiring follows in phase 4.
+
+### Fixed
+
+- **`_parse_float` data-integrity bugs (R635, discovered by R634
+  reproduction tests):**
+  - NaN and inf were passed through unchanged, poisoning COP
+    aggregates and ML anomaly scores. Now return None.
+  - EU decimal `"1,5"` was truncated to `1.0` (33% error) because
+    `_NUM_RE` stopped at the comma. Now pre-processed to `1.5`.
+  - Scientific notation `"5.0e2"` was truncated to `5.0` (100x
+    error) because `_NUM_RE` matched only the leading number. Now
+    attempted as `float(s)` first, with `_NUM_RE` as suffix fallback.
+  - Ambiguous commas (`"1,5,0"`, `"1,500"` with 3-digit tail) now
+    rejected instead of silently truncating to `1.0` or `1.5`.
+  - Suffix support (`"5.0 kW"` -> 5.0) preserved via hybrid strategy
+    (float first, `_NUM_RE` fallback) to avoid breaking existing
+    integrations.
+  
+- **`_parse_bool` string variants (R635):** pre-fix only matched the
+  literal string `'ON'`. `TRUE`, `yes`, `1`, and other truthy
+  variants silently returned False. Now accepts `ON`, `TRUE`, `YES`,
+  `1` case-insensitively.
+
+- **`parse_global_cop_attrs` defrost (R635):** used inline string
+  comparison `str(v).upper() == 'ON'`, so `defrost_operation=True`
+  (bool), `1` (int), or `'on'` (lowercase) never triggered defrost
+  detection. Defrost samples passed the classifier as valid COP.
+  Now uses `_parse_bool` (same helper as `power_stable`).
+
+### Changed
+
+- **`_parse_float` dead branch removed (R637):** the `if len(parts)
+  == 2: ... else: return None` inside the EU-decimal handler was
+  unreachable (a `count(",") == 1` guard guarantees exactly 2 parts
+  from `split(",")`). Removed rather than masked with
+  `# pragma: no cover`.
+
+### Fixed
+
+- **`source_stale` false positives (hourly pattern, real prod 2026-11-05):**
+  `_is_source_stale` and `_alert_binary_states` measured `last_success_ts`
+  (coordinator tick) rather than the source entity `last_updated`. A slow
+  tick (ML pipeline, rollup, datasheet refresh) made both paths fire a
+  `critical` alert at 120s even though the source was updating every
+  22-33s. Prod-1 evidence: alerts at 09:15, 10:16, 11:18 (61-62 min apart)
+  with healthy source throughout. Because `source_stale` bypasses quiet
+  hours, this hit every user with 1 alert/hour at night. Fix: check
+  `hass.states.get(source_entity).last_updated` with isinstance-guard,
+  fall back to tick-based only for unit tests / missing entity / malformed
+  state. `_alert_binary_states` now delegates to `_is_source_stale` — one
+  source of truth, no drift. Adds 7 regression tests (RED before fix).
+
 ## [1.19.8] - 2026-11-05
 
 ### Added
