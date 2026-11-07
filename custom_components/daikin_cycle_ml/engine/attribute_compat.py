@@ -27,17 +27,31 @@ ALIAS_GROUPS: dict[str, tuple[str, ...]] = {
         "D(C)",
         "Outlet Water Temp.",
         "Outlet Water BUH Temp. (R2T)",
+        # v1.20.0 #281: ECH2O variants publish "after buffer/BUH" name
+        "[HPSU] Tvbh inflow Temp after Buffer/BUH (R2T)",
     ),
     "Inlet water temp.(R4T)": (
         "Inlet water temp. (R4T)",
         "Inlet water temp.(C)",
         "[HPSU] Tr return Temp (R4T)",
         "Inlet temperature(R4T)",
+        # v1.20.0 #281: EPSK publishes inlet via "water heat exchanger"
+        "Inlet water temp. (water heat exchanger)",
     ),
     "Outdoor air temp.(R1T)": (
         "R1T-Outdoor air temp.",
         "Outdoor air temp. (R1T)",
         "Outdoor air temp.(C)",
+        # v1.20.0 #281: Hybrid model publishes without "(R1T)" suffix
+        "Outdoor air temp.",
+    ),
+    # v1.20.0 #281: ESPAltherma publishes "BE_COP" (underscore) on some
+    # firmware, which make_json_key slugifies to "becop". Our canonical
+    # constant uses "BE COP" (space) -> "be_cop". Alias group makes both
+    # variants resolve.
+    "BE COP": (
+        "BE_COP",
+        "BECOP",
     ),
     "Refrig. Temp. liquid side (R3T)": (
         "Refrig. Temp. liquid side(R3T)",

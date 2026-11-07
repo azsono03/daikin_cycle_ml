@@ -36,6 +36,8 @@ from .const import (
     ATTR_OUTDOOR_AIR_R1T,
     ATTR_TARGET_COND_TEMP,
     BUH_7D_RATIO_THRESHOLD_DEFAULT,
+    CONF_INDIVIDUAL_PREFIX,
+    CONF_SOURCE_TYPE,
     COP_CURVE_RECENT_HOURS,
     COP_CURVE_RECENT_MAX_POINTS,
     COP_LOW_MIN_SAMPLES,
@@ -47,6 +49,7 @@ from .const import (
     DEFAULT_COMFORT_MIN_C,
     DEFAULT_CYCLE_RETENTION_DAYS,
     DEFAULT_DHW_PENDULUM_CPH,
+    DEFAULT_INDIVIDUAL_PREFIX,
     DEFAULT_MODEL_STATE_RETENTION_DAYS,
     DEFROST_7D_COUNT_THRESHOLD_DEFAULT,
     DEGRADATION_BASELINE_DAYS,
@@ -68,7 +71,11 @@ from .const import (
     MODE_HEATING,
     MODEL_BASISPROFIEL,
     OPTION_DAILY_SUMMARY_LIVE_ENABLED,
+    REQUIRED_ATTRIBUTES,
     SOURCE_SENSOR_ENTITY,
+    SOURCE_TYPE_AUTO,
+    SOURCE_TYPE_INDIVIDUAL,
+    SOURCE_TYPE_MONOLITHIC,
     STOOKLIJN_MIN_CONFIDENCE,
     STOOKLIJN_MIN_SAVINGS_PCT,
     TEST_ALERT_DELTA,
@@ -88,6 +95,7 @@ from .engine.cop_degradation import (
     build_dirty_hours,
 )
 from .engine.cycle_detector import CycleDetector
+from .engine.espaltherma_v2.resolver import resolve_attrs
 from .engine.model_datasheets import (
     UserDatasheetError,
 )
@@ -465,6 +473,21 @@ def _as_opt_float(v: object) -> float | None:
     return None
 
 
+@dataclass
+class _AutoSourceChoice:
+    """Resolved AUTO source (v1.20.0 #281 T8b). Internal only."""
+    chosen: str  # "monolithic" or "individual"
+    mono_state: Any
+    mono_attrs: dict[str, Any]
+    mono_missing: list[str]
+    ind_attrs: dict[str, Any]
+    ind_missing: list[str]
+    ind_discovered: int
+    mono_cov: int
+    ind_cov: int
+    reason: str
+
+
 class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
     """Reads the source sensor every UPDATE_INTERVAL_SECONDS."""
 
@@ -516,10 +539,22 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
     # in the _async_update_data except handler.
     _errors_total: int = 0
 
+    # v1.20.0 (#281): source-type dispatch. Class-level defaults so
+    # partial test fixtures (object.__new__ without __init__) still
+    # work without AttributeError on _async_update_data.
+    source_type: str = SOURCE_TYPE_MONOLITHIC
+    individual_prefix: str = DEFAULT_INDIVIDUAL_PREFIX
+
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         self.entry = entry
         self.source_entity: str = entry.data.get(
             "source_sensor", SOURCE_SENSOR_ENTITY
+        )
+        self.source_type = entry.data.get(
+            CONF_SOURCE_TYPE, SOURCE_TYPE_MONOLITHIC
+        )
+        self.individual_prefix = entry.data.get(
+            CONF_INDIVIDUAL_PREFIX, DEFAULT_INDIVIDUAL_PREFIX
         )
         model = entry.data.get("model", MODEL_BASISPROFIEL)
         # v1.19.0 (#241): uppercase model-SKU voor notificatie-subtitle.
@@ -591,6 +626,8 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         # _last_mode_change_ts = last non-unknown mode transition.
         # 0.0 = bootstrap (allow samples immediately on cold start).
         self._last_mode_change_ts: float = 0.0
+        self._auto_last_chosen: str = ""
+        self._source_resolution: dict[str, Any] = {}
         self._last_observed_mode: str = ""
         # v1.19.9 #123: daily reject-tracking for cop_physically_impossible.
         self._cop_rejected_today_count: int = 0
@@ -1572,7 +1609,96 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         if cop_r <= 0:
             # Tiny positive cop rounds to 0.0 -- reject (R643)
             return None, "cop_out_of_range"
-        return cop_r, f"computed_{power_src}"
+        # v1.20.0 #281: return explicit source tag when v2 heat output was
+        # used (pre-existing bug: _tsrc was assigned but never returned, so
+        # snap.cop_source always showed "computed_*" even when the ESP32
+        # pre-calculated heat output was the actual source).
+        # Backward-compatible: only promote the v2-specific tag; all other
+        # paths keep the existing "computed_<power_src>" format (2 existing
+        # tests still expect that format for V1 fallback).
+        _src = (
+            "espaltherma_heat_output"
+            if _tsrc == "espaltherma_heat_output"
+            else f"computed_{power_src}"
+        )
+        return cop_r, _src
+
+    def _resolve_auto_source(self) -> _AutoSourceChoice:
+        """Coverage-based AUTO source resolution (#281 T8b).
+
+        Q1 (user): v2 wins on tie.
+        Q2 (user): freeze when both empty (preserve GAP-4 stale alert).
+        Q3 (user): INFO on first choice, WARNING on switch.
+        Q4 (user): populate _source_resolution for diagnostics.
+        """
+        mono_state = self.hass.states.get(self.source_entity)
+        mono_attrs: dict[str, Any] = {}
+        mono_missing: list[str] = []
+        if mono_state is not None:
+            cmap = (
+                self.options.get("custom_attribute_map")
+                or self.entry.data.get("custom_attribute_map")
+                or self.entry.data.get("attribute_map")
+            )
+            mono_attrs = read(mono_state, custom_map=cmap)
+            mono_missing = missing_required(mono_attrs)
+            mono_cov = len(REQUIRED_ATTRIBUTES) - len(mono_missing)
+        else:
+            # v1.20.0 #281 T8b fix: non-existent monolithic entity means
+            # 0 coverage, NOT full coverage. Without this, mono_cov would
+            # default to 12 (missing=[]), incorrectly beating a partial
+            # v2 source and freezing the coordinator in AUTO mode.
+            mono_cov = 0
+
+        ind = resolve_attrs(self.hass, prefix=self.individual_prefix)
+        ind_attrs = dict(ind.attrs)
+        ind_missing = list(ind.missing_required)
+        ind_cov = len(REQUIRED_ATTRIBUTES) - len(ind_missing)
+
+        if mono_cov == 0 and ind_cov == 0:
+            chosen = "monolithic"
+            reason = (
+                f"both empty (mono {mono_cov}/{len(REQUIRED_ATTRIBUTES)}, "
+                f"v2 {ind_cov}/{len(REQUIRED_ATTRIBUTES)}); freeze"
+            )
+        elif ind_cov >= mono_cov:
+            chosen = "individual"
+            reason = (
+                f"v2 {ind_cov}/{len(REQUIRED_ATTRIBUTES)} >= "
+                f"mono {mono_cov}/{len(REQUIRED_ATTRIBUTES)}"
+            )
+        else:
+            chosen = "monolithic"
+            reason = (
+                f"mono {mono_cov}/{len(REQUIRED_ATTRIBUTES)} > "
+                f"v2 {ind_cov}/{len(REQUIRED_ATTRIBUTES)}"
+            )
+
+        if chosen != self._auto_last_chosen:
+            if self._auto_last_chosen:
+                _LOGGER.warning(
+                    "source auto: switched %s -> %s (%s)",
+                    self._auto_last_chosen, chosen, reason,
+                )
+            else:
+                _LOGGER.info("source auto: chose %s (%s)", chosen, reason)
+            self._auto_last_chosen = chosen
+
+        self._source_resolution = {
+            "mode": "auto",
+            "mono_coverage": mono_cov,
+            "v2_coverage": ind_cov,
+            "required_total": len(REQUIRED_ATTRIBUTES),
+            "chosen": chosen,
+            "reason": reason,
+        }
+
+        return _AutoSourceChoice(
+            chosen=chosen, mono_state=mono_state, mono_attrs=mono_attrs,
+            mono_missing=mono_missing, ind_attrs=ind_attrs,
+            ind_missing=ind_missing, ind_discovered=ind.discovered_count,
+            mono_cov=mono_cov, ind_cov=ind_cov, reason=reason,
+        )
 
     async def _async_update_data(self) -> DataSnapshot:
         now = time.time()
@@ -1591,34 +1717,66 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
             await self._restore_runtime_acc()
         self._maybe_reset_daily_accumulators(now)
         try:
-            state = self.hass.states.get(self.source_entity)
-            if state is None:
-                return snap
-            custom_map = (
-                self.options.get("custom_attribute_map")
-                or self.entry.data.get("custom_attribute_map")
-                or self.entry.data.get("attribute_map")
-            )
-            attrs = read(state, custom_map=custom_map)
-            snap.attrs = attrs
-            snap.missing_attrs = missing_required(attrs)
-            snap.last_success_ts = now
-            if snap.missing_attrs:
-                # v1.12.1 (#109): freeze detector when source
-                # publishes partial attrs. Post-restart ESPAltherma
-                # may not be ready; advancing detector with empty
-                # rps force-closes the running cycle -> phantom
-                # ~60s off-gap -> short_off alert. last_success_ts
-                # is intentionally NOT frozen so source_stale still
-                # tracks real sensor liveness.
+            state: Any = None
+            attrs: dict[str, Any] = {}
+
+            if self.source_type == SOURCE_TYPE_AUTO:
+                # v1.20.0 #281 T8b: coverage-based AUTO selection.
+                choice = self._resolve_auto_source()
+                if choice.chosen == "individual":
+                    attrs = choice.ind_attrs
+                    snap.attrs = attrs
+                    snap.missing_attrs = list(choice.ind_missing)
+                    if choice.ind_discovered > 0:
+                        snap.last_success_ts = now
+                    _should_freeze = len(attrs) == 0
+                else:
+                    if choice.mono_state is None:
+                        return snap
+                    attrs = choice.mono_attrs
+                    snap.attrs = attrs
+                    snap.missing_attrs = list(choice.mono_missing)
+                    snap.last_success_ts = now
+                    _should_freeze = bool(snap.missing_attrs)
+            elif self.source_type == SOURCE_TYPE_INDIVIDUAL:
+                # v1.20.0 #281: ESPAltherma v2 individual entities.
+                result = resolve_attrs(self.hass, prefix=self.individual_prefix)
+                attrs = dict(result.attrs)
+                snap.attrs = attrs
+                snap.missing_attrs = list(result.missing_required)
+                if result.discovered_count > 0:
+                    snap.last_success_ts = now
+                _should_freeze = len(attrs) == 0
+            else:  # SOURCE_TYPE_MONOLITHIC
+                state = self.hass.states.get(self.source_entity)
+                if state is None:
+                    return snap
+                custom_map = (
+                    self.options.get("custom_attribute_map")
+                    or self.entry.data.get("custom_attribute_map")
+                    or self.entry.data.get("attribute_map")
+                )
+                attrs = read(state, custom_map=custom_map)
+                snap.attrs = attrs
+                snap.missing_attrs = missing_required(attrs)
+                snap.last_success_ts = now
+                _should_freeze = bool(snap.missing_attrs)
+
+            if _should_freeze:
+                # v1.12.1 (#109): freeze detector when source publishes
+                # partial attrs. Post-restart ESPAltherma may not be ready;
+                # advancing detector with empty rps treats the compressor
+                # as off and force-closes the running cycle -> phantom
+                # ~60s off-gap -> short_off alert. last_success_ts is
+                # intentionally NOT frozen so source_stale still tracks
+                # real sensor liveness.
                 _frozen = self.detector.snapshot()
                 snap.state = self.detector.state
                 snap.mode = _frozen.get("mode", "unknown")
                 snap.cycle_start_ts = float(_frozen.get("start_ts") or 0.0)
-                # v1.20.0 #280: tick tolerates partial attrs (guards None
-                # internally). Must run during freeze so non-BUH models and
-                # partial v2 attrs keep incrementing defrost/BUH counters.
-                # Detector itself remains frozen (#109 phantom protection).
+                # v1.20.0 #280: tick tolerates partial attrs. Runs during
+                # freeze so non-BUH models and partial v2 attrs keep
+                # incrementing defrost/BUH counters.
                 self._tick_buh_and_defrost(attrs, now)
                 return snap
             self._track_setpoint(attrs)

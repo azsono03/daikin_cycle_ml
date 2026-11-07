@@ -2,29 +2,146 @@
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-11-07
+
+
+### Added
+
+- **ESPAltherma v2 beta native support** (#281): the integration accepts
+  ESPAltherma v2 beta's individual entity model (`sensor.espaltherma_*`
+  and `binary_sensor.espaltherma_*`) alongside the classic monolithic
+  entity (`sensor.althermasensors`). Config flow offers **Monolithic
+  entity**, **Individual entities**, or **Auto-detect**.
+- **`engine/espaltherma_v2/` package** (~340 lines): exact `makeJsonKey`
+  C++ replica (`slug.py`), prefix discovery across both `sensor.` and
+  `binary_sensor.` domains (`discovery.py`), and alias-aware v2 entities →
+  canonical attrs resolver (`resolver.py`) backed by
+  `docs/MODEL_ATTRIBUTES.json` (422 labels across 40 models, SHA 714ad016).
+- **`source_type` selector in setup wizard** (monolithic / individual /
+  auto) with discovery preview: `mono_found`, `v2_count`, `suggestion`.
+- **`individual_prefix` + `individual_review` wizard steps**: prompt and
+  confirm the ESPAltherma v2 entity prefix with matched/missing/collisions
+  reporting.
+- **`source_type` + `individual_prefix` in OptionsFlow device step**:
+  switch sources without re-adding the integration (DB preserved).
+- **`espaltherma_v2_missing_attrs` repair**: actionable repair listing
+  exactly which required v2 sensors aren't published.
+- **Coverage-based AUTO coexistence** (`_resolve_auto_source`): picks the
+  source with more required attributes matched. Per user decision: v2
+  wins on tie; freeze when both empty (preserve GAP-4 stale alert). Logs
+  INFO on first choice, WARNING on switch. Exposed via `source_resolution`
+  in HA Diagnostics.
+- **`CONSUMED_ATTRIBUTES` transparency contract** (25 labels): 12 required
+  + 13 optional/dynamic. Every unresolved consumed label lands in the
+  new `missing_consumed` field on `ResolveResult` — required-missing
+  labels appear in both lists (never hidden).
+- **`CONSUMED_ATTRIBUTE_FEATURES` mapping**: each consumed label mapped
+  to its downstream feature (cycle_detection, cop_calculation,
+  dhw_classification, v2_stats_cop_cascade, etc.).
+- **`V2_STATS_CONSUMED_LABELS`** (3 labels): `Stats: Heat output (kW)`,
+  `Stats: Electrical input estimated (kW)`, `Stats: Electricalinput
+  estimated (kW)` (firmware typo). Optional power-ups — when present the
+  COP cascade uses ESPAltherma's on-device computation (accurate within
+  ~0.5%); when absent the integration falls back to the internal
+  `compute_thermal_power_live` path (~6% COP drift).
+- **`docs/MODEL_COVERAGE.md`**: per-model coverage matrix for 34 real
+  Altherma models + HT exclusions. Documents which of the 21 operational
+  attributes resolve per model and why some legitimately don't.
+
+### Changed
+
+- **Config-flow wizard now has 19 steps** (was 17) — adds
+  `individual_prefix` and `individual_review`.
+- **Entry title** shows `(v2 sensor.espaltherma_)` or `(auto)` instead
+  of empty `()` in individual/auto modes.
+- **`_normalize()` filters `inf` / `infinity` / `-inf` / `+inf` as null**.
+- **`ALIAS_GROUPS` extended with 5 model-specific variant mappings**:
+  `Outlet Water BUH Temp. (R2T)`, `[HPSU] Tvbh inflow Temp after
+  Buffer/BUH (R2T)`, `Inlet water temp. (water heat exchanger)`,
+  `[HPSU] Tr return Temp (R4T)`, `Outdoor air temp.` — all resolve to
+  their canonical counterparts. Also `BE_COP` and `BECOP` resolve to
+  canonical `BE COP`.
+
 ### Fixed
 
+- **P1: `resolve_attrs` limited to 12 labels** (#281): the v2 resolver
+  iterated only `REQUIRED_ATTRIBUTES`, silently dropping 10 downstream-
+  consumed labels (COP, INV frequency, DHW tank, target cond, indoor
+  ambient, boiler×2, hybrid mode, BE COP) in individual mode. Cycle
+  detection, COP calculation, DHW classification, stooklijn advice,
+  hybrid analytics, comfort analysis were all inactive for v2 users.
+  Now iterates `CONSUMED_ATTRIBUTES` (25).
+- **P1: AUTO mode froze when mono missing** (#281): `mono_cov` defaulted
+  to 12 when the entity was absent, incorrectly beating a partial v2
+  source. Now `mono_cov=0`.
+- **P3: `cop_source` was a dead variable** (pre-existing since v1.19.10
+  #273): `_read_cop_effective` assigned `_tsrc = "espaltherma_heat_output"`
+  when v2 heat output drove the COP but never returned it. Users with
+  ESPAltherma v2 heat output now see the correct source in HA
+  Diagnostics.
+- **Silent discovery failure** (R580): `except Exception: pass` on v2
+  entity probing now logs WARNING with exception type + message.
+- **Silent options-save failure** (R580): `_LOGGER.debug` on failed
+  source_type persist now logs WARNING with "change NOT persisted".
+- **v2 `binary_sensor.espaltherma_*` entities ignored**: discovery now
+  scans both `sensor.` and `binary_sensor.` domains. On/off values
+  (`"on"` / `"off"`) normalize to Python `bool` via existing `_normalize`.
+  Affected labels: `Defrost Operation`, `BUH Step1`, `BUH Step2`,
+  `Water pump operation`, `3way valve(On:DHW_Off:Space)`, boiler
+  demands.
+- **R1T-variant labels not resolving in v2**: models publishing
+  `R1T-Outdoor air temp.` (34 of 40) now resolve the canonical
+  `Outdoor air temp.(R1T)` via alias.
+- **Model-specific variant labels not resolving**: 5 additional aliases
+  added for ECH2O, EPSK and Hybrid models (see Changed above).
 - **Defrost counter stays at zero on non-BUH models** (#280): a freeze
   gate paused the BUH/defrost tick whenever any required attribute
   (including `BUH Step1`/`BUH Step2` on units without a backup heater)
   was missing. The tick now runs during freeze — detector remains
   frozen per #109 phantom protection, but counters increment.
-- **Defrost duration double-counted on OFF transition** (#280): a
-  running tally during defrost was added again on OFF, inflating
-  totals by ~tick_count×interval per defrost. Now computed from
-  `prior + elapsed` once.
-- **Multi-defrost running tally showed max instead of sum** (#280):
-  with two defrosts in a day, the live display during defrost #2
-  overwrote defrost #1's contribution. Now correctly `prior + current`.
-- **Defrost count double-counted after HA restart mid-defrost** (#280):
-  `_defrost_start_ts` and `_prev_defrost` were not persisted, so the
-  next ON tick after restart incremented count again. Both now round-trip
-  through `_persist_runtime_acc`/`_restore_runtime_acc`.
-- **BUH electrical power ignored when attrs arrive as bool** (#280):
-  `_is_on` only matched the string `"ON"`, but `read()` normalizes to
-  Python `bool`. BUH Step1/Step2 bool `True` now counted; also accepts
-  int and additional truthy strings.
+- **Defrost duration double-counted on OFF transition** (#280).
+- **Multi-defrost running tally showed max instead of sum** (#280).
+- **Defrost count double-counted after HA restart mid-defrost** (#280).
+- **BUH electrical power ignored when attrs arrive as bool** (#280).
 
+### Test suite
+
+- **635 v2 tests** across 27 test files (~9000 lines):
+  - 93 per-attribute matrix
+  - 468 discovery (422 upstream labels, 4 case-only collisions, 200-case fuzz)
+  - 3 resolver alias tests + 26 total
+  - 13 config-flow + 8 E2E
+  - 8 coordinator dispatch
+  - 8 repairs
+  - 18 full-support (6 GAPs)
+  - 12 HA lifecycle
+  - 12 flap recovery
+  - 8 restart with open cycle
+  - 7 services E2E
+  - 11 ML on v2 attrs
+  - 11 EPRA12EAV3 full-coverage (real 138-entity user install)
+  - 24 model-coverage matrix (34 real models + HT exclusions + Stats source check)
+  - 13 COP→daily E2E
+  - 12 prod-DB simulation (6023 samples, 215 cycles, live 2026-11-07)
+- **100% line coverage** maintained on all modules.
+- **HA 2026+ compliance** verified across 7 potential deprecation checks.
+
+### Known limitations
+
+- **Coexistence merge** (combine both sources simultaneously) not
+  implemented — coverage-based pick only. Planned for v1.21.0.
+- **HT models** (`Altherma(HT ERRQ-ERSQ)`, `Altherma(HT EKHBRD-ERRQ)`):
+  different register protocol, do not publish the 4 source attributes
+  needed for Stats. Out of current scope.
+- **ESPAltherma firmware requirement for Stats**: v2.0.0-beta.19 or
+  newer. Older firmware does not compute Stats; COP falls back to the
+  internal computation path (~6% drift).
+- **Per-model `not_applicable`**: legitimately absent labels (non-DHW
+  without R5T, non-hybrid without boiler, single-compressor without
+  INV freq 2) still show as missing in the repair issue. Planned for
+  v1.21.0 to distinguish misconfiguration from legitimately-absent.
+- **Custom-map UI in repair dialog** — currently requires Options →
+  Advanced → Custom Attribute Map. Planned for v1.21.0.
 
 ## [1.19.10] - 2026-11-06
 
