@@ -80,6 +80,7 @@ from .const import (
     DEFAULT_VACUUM_ENABLED,
     DOMAIN,
     LANG_EN,
+    LANG_FR,
     LANG_NL,
     MODEL_BASISPROFIEL,
     MODEL_CHOICES,
@@ -196,6 +197,7 @@ def _build_language_selector() -> selector.SelectSelector:
             options=[
                 selector.SelectOptionDict(value=LANG_EN, label="English"),
                 selector.SelectOptionDict(value=LANG_NL, label="Nederlands"),
+                selector.SelectOptionDict(value=LANG_FR, label="Fran\u00e7ais"),
             ],
             mode=selector.SelectSelectorMode.DROPDOWN,
         )

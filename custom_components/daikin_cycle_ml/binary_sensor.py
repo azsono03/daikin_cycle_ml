@@ -24,9 +24,11 @@ from .const import (
     ATTR_BUH_STEP2,
     ATTR_DEFROST_OPERATION,
     ATTR_IU_OPERATION_MODE,
+    DEFAULT_INDIVIDUAL_PREFIX,
     MODE_COOLING,
     MODE_DHW,
     MODE_HEATING,
+    SOURCE_TYPE_INDIVIDUAL,
     UPDATE_INTERVAL_SECONDS,
 )
 from .coordinator import DaikinCycleMLCoordinator, DataSnapshot
@@ -202,6 +204,31 @@ def _is_source_stale(s: DataSnapshot, c: DaikinCycleMLCoordinator) -> bool:
     # 10:16, 11:18 (61-62 min apart) with healthy source throughout.
     hass = getattr(c, "hass", None)
     src_entity = getattr(c, "source_entity", None)
+    # Individual (ESPAltherma v2) sources: there is no single monolithic
+    # entity. `source_sensor` keeps whatever the config flow stored (often
+    # a slow-changing entity such as operation_mode, whose last_updated
+    # only moves on a state change), so judge freshness on the most
+    # recently updated entity under the v2 prefix instead.
+    if (
+        hass is not None
+        and getattr(c, "source_type", None) == SOURCE_TYPE_INDIVIDUAL
+    ):
+        from datetime import datetime as _dt
+
+        from .engine.espaltherma_v2.discovery import discover_entity_ids
+        _latest = 0.0
+        for _eid in discover_entity_ids(
+            hass, prefix=getattr(c, "individual_prefix", None)
+            or DEFAULT_INDIVIDUAL_PREFIX
+        ):
+            _st = hass.states.get(_eid)
+            _lu = getattr(_st, "last_reported", None) or getattr(
+                _st, "last_updated", None
+            )
+            if isinstance(_lu, _dt):
+                _latest = max(_latest, _lu.timestamp())
+        if _latest > 0:
+            return (_now() - _latest) > thr
     if hass is not None and src_entity:
         st = hass.states.get(src_entity)
         if st is not None:

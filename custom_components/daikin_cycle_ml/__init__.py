@@ -249,6 +249,15 @@ async def _async_cleanup_orphan_dbs(hass: HomeAssistant) -> None:
     except Exception:  # pragma: no cover
         _LOGGER.debug("Orphan DB cleanup failed", exc_info=True)
 
+try:
+    from homeassistant.config_entries import (  # noqa: F401
+        OptionsFlowWithReload as _OFWR,
+    )
+    _HAS_OPTIONS_FLOW_WITH_RELOAD = True
+except ImportError:  # pragma: no cover - legacy core
+    _HAS_OPTIONS_FLOW_WITH_RELOAD = False
+
+
 async def _async_options_updated(
     hass: HomeAssistant, entry: ConfigEntry,
 ) -> None:
@@ -267,9 +276,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Daikin Cycle ML from a config entry."""
     await _async_cleanup_orphan_dbs(hass)
     coordinator = DaikinCycleMLCoordinator(hass, entry)
-    entry.async_on_unload(
-        entry.add_update_listener(_async_options_updated)
-    )
+    # HA 2026.x refuses an update listener on an entry whose options flow
+    # is an OptionsFlowWithReload ("Config entry update listeners should
+    # not be used with OptionsFlowWithReload" -> 500 on every options
+    # save). OptionsFlowWithReload already reloads the entry after a save,
+    # so the manual listener is only needed on older cores without it.
+    if not _HAS_OPTIONS_FLOW_WITH_RELOAD:  # pragma: no cover - legacy core
+        entry.async_on_unload(
+            entry.add_update_listener(_async_options_updated)
+        )
     try:
         await coordinator.async_reload_user_datasheets()
         clear_datasheet_load_failed(hass, entry.entry_id)

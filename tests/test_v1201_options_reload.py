@@ -55,30 +55,38 @@ def test_options_updated_function_exists():
     assert callable(_async_options_updated)
 
 
-def test_setup_entry_registers_options_listener():
-    """Structural: async_setup_entry wires entry.add_update_listener."""
+def test_setup_entry_no_listener_with_options_flow_with_reload():
+    """HA 2026.11 raises "Config entry update listeners should not be used
+    with OptionsFlowWithReload" (HTTP 500 on every options save) when an
+    entry whose options flow reloads by itself also has an update
+    listener. OptionsFlowWithReload already reloads the entry, so the
+    manual listener must only be wired on cores that lack it."""
+    import custom_components.daikin_cycle_ml as integ
+    from custom_components.daikin_cycle_ml import config_flow
+    from homeassistant import config_entries
+
+    has_ofwr = hasattr(config_entries, "OptionsFlowWithReload")
+    assert integ._HAS_OPTIONS_FLOW_WITH_RELOAD is has_ofwr
+    if has_ofwr:
+        assert issubclass(
+            config_flow.DaikinCycleMLOptionsFlow,
+            config_entries.OptionsFlowWithReload,
+        )
     src = Path(
         "custom_components/daikin_cycle_ml/__init__.py"
     ).read_text()
     tree = ast.parse(src)
     lines = src.splitlines()
-    found = False
+    body = ""
     for node in ast.walk(tree):
         if (
             isinstance(node, ast.AsyncFunctionDef)
             and node.name == "async_setup_entry"
         ):
             body = "\n".join(lines[node.lineno - 1 : node.end_lineno])
-            if (
-                "add_update_listener" in body
-                and "_async_options_updated" in body
-            ):
-                found = True
             break
-    assert found, (
-        "async_setup_entry does not register _async_options_updated "
-        "via entry.add_update_listener"
-    )
+    assert "if not _HAS_OPTIONS_FLOW_WITH_RELOAD" in body
+    assert "add_update_listener(_async_options_updated)" in body
 
 
 # --- #289: waiver checkbox in both flows ---------------------------------

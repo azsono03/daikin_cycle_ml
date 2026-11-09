@@ -16,6 +16,7 @@ from custom_components.daikin_cycle_ml.const import (
     ATTR_INLET_WATER_R4T,
     ATTR_IU_OPERATION_MODE,
     ATTR_LEAVING_WATER_AFTER_BUH,
+    ATTR_LEAVING_WATER_BEFORE_BUH,
     ATTR_LW_SETPOINT,
     ATTR_OPERATION_MODE,
     ATTR_OUTDOOR_AIR_R1T,
@@ -103,6 +104,7 @@ def _full_payload_25() -> dict[str, str]:
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_INV_FREQUENCY_2_RPS)}": "15",
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_DHW_TANK_TEMP)}": "55.0",
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_INDOOR_AMBIENT_R1T)}": "21.5",
+        f"{DEFAULT_PREFIX}{make_json_key(ATTR_LEAVING_WATER_BEFORE_BUH)}": "40.5",
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_TARGET_COND_TEMP)}": "38.0",
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_BOILER_OPERATION_DEMAND)}": "OFF",
         f"{DEFAULT_PREFIX}{make_json_key(ATTR_BOILER_DHW_DEMAND)}": "OFF",
@@ -374,7 +376,7 @@ def test_resolve_extra_consumed_missing_not_in_required() -> None:
     extra_labels = set(CONSUMED_ATTRIBUTES) - set(REQUIRED_ATTRIBUTES)
     assert result.missing_required == []
     assert set(result.missing_consumed) == extra_labels
-    assert len(result.missing_consumed) == 13  # 25 consumed - 12 required
+    assert len(result.missing_consumed) == 14  # 26 consumed - 12 required
 
 
 def test_resolve_missing_required_also_in_missing_consumed() -> None:

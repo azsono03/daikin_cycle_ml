@@ -70,6 +70,7 @@ from .const import (
     MODE_DHW,
     MODE_HEATING,
     MODEL_BASISPROFIEL,
+    MODEL_CUSTOM,
     OPTION_DAILY_SUMMARY_LIVE_ENABLED,
     REQUIRED_ATTRIBUTES,
     SOURCE_SENSOR_ENTITY,
@@ -132,8 +133,8 @@ from .engine.thermal import (
     boiler_heat_active_from_attrs as _boiler_heat_active_from_attrs,
 )
 from .engine.thermal import compute_thermal_power_live as _compute_thermal_power_live
-from .engine.thermal import dt_from_attrs as _dt_from_attrs
 from .engine.thermal import dhw_tank_temp_from_attrs as _dhw_tank_temp_from_attrs
+from .engine.thermal import dt_from_attrs as _dt_from_attrs
 from .engine.thermal import flow_from_attrs as _flow_from_attrs
 from .engine.thermal import (
     hybrid_mode_from_attrs as _hybrid_mode_from_attrs,
@@ -2899,6 +2900,20 @@ class DaikinCycleMLCoordinator(DataUpdateCoordinator[DataSnapshot]):
         self._datasheet_user = await _load_user_datasheets(
             self.hass, self.entry.entry_id
         )
+        # The "custom" model's spec typed in the config flow
+        # (model_custom_info -> entry.data["custom_datasheet"]) was stored
+        # but never read: hp_specs reported "no datasheet for this model".
+        # Use it as the "custom" datasheet unless the user imported one
+        # explicitly through daikin_cycle_ml.import_datasheet (that wins).
+        _flow_spec = (self.entry.data or {}).get("custom_datasheet")
+        if (
+            isinstance(_flow_spec, dict)
+            and _flow_spec
+            and MODEL_CUSTOM not in self._datasheet_user
+        ):
+            self._datasheet_user = {
+                **self._datasheet_user, MODEL_CUSTOM: dict(_flow_spec)
+            }
         _bundled = await asyncio.get_running_loop().run_in_executor(
             None, _load_bundled_datasheets
         )

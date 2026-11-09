@@ -1,5 +1,26 @@
 # Changelog
 
+## [1.22.0-fr.1] - 2026-11-09 (fork azsono03)
+
+### Fixed
+- Options flow crashed (HTTP 500) on Home Assistant 2026.11: the manual
+  update listener is no longer registered when `OptionsFlowWithReload`
+  already reloads the entry.
+- ESPAltherma v2 (individual entities): `source_stale` is now judged on
+  the freshest `espaltherma_*` entity, not on the slow-changing
+  `source_sensor` (false "Source stale" alert).
+- `custom` model: the spec typed in the config flow is now used as the
+  datasheet (`hp_specs` reported "no datasheet for this model").
+- `Leaving water temp. before BUH (R1T)` is resolved for v2 sources, so
+  the compressor delta-T uses R1T like monolithic sources.
+
+### Added
+- Altherma 3 H HT single-phase outdoor units EPRA14DAV3 / EPRA16DAV3 /
+  EPRA18DAV3 (Daikin EN14511 data, LWT up to 70 °C).
+- French (`fr`): config/options flows, entity names, services, repairs,
+  notifications and reports, and the five dashboard cards
+  (`scripts/translate_cards_fr.py`, `scripts/build_fr_translation.py`).
+
 ## [1.22.0] - 2026-11-09
 
 ### Added
