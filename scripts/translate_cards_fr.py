@@ -210,6 +210,8 @@ EXTRA = {
         ("cm==='dhw'?'DHW':", "cm==='dhw'?T('SWW','DHW'):"),
         ("lastMode==='dhw'?'DHW':", "lastMode==='dhw'?T('SWW','DHW'):"),
         ("renderModeCard('💧', 'DHW',", "renderModeCard('💧', T('SWW','DHW'),"),
+        ("'\">week <b", "'\">'+T('week','week')+' <b"),
+        ("'\">365d <b", "'\">'+T('365d','365d')+' <b"),
     ],
     "daily-summary-tabbed/daily-summary-tabbed.yaml": [
         ("+' cycli · '+fmtBigHours", "+(LANG==='fr'?' cycles · ':' cycli · ')+fmtBigHours"),
@@ -217,6 +219,10 @@ EXTRA = {
         ("name:'DHW',", "name:FR('DHW'),"),
     ],
     "pattern-analysis/pattern-analysis.yaml": [
+        ("'SHORT 20-60m')", "FR('SHORT 20-60m'))"),
+        ("'GOOD 60-180m')", "FR('GOOD 60-180m'))"),
+        ("'LONG >180m')", "FR('LONG >180m'))"),
+        ("{t:'kv',k:'Last 7d',", "{t:'kv',k:FR('Last 7d'),"),
         ("{label:'PENDEL', sub:'<20m'", "{label:(LANG==='fr'?'TROP COURT':'PENDEL'), sub:'<20m'"),
         ("{label:'KORT', sub:'20-60m'", "{label:(LANG==='fr'?'COURT':'KORT'), sub:'20-60m'"),
         ("{label:'GOED', sub:'60-180m'", "{label:(LANG==='fr'?'BON':'GOED'), sub:'60-180m'"),
@@ -242,6 +248,9 @@ if __name__ == "__main__":
             print("skip (already FR):", rel)
             continue
         out = fn(src)
+        if rel.startswith(("daily-summary-tabbed", "pattern-analysis")):
+            out = re.sub(r"\+'d'", "+(LANG==='fr'?' j':'d')", out)
+            out = re.sub(r"\+(\w+(?:\.\w+)?)\+'d<", r"+\1+(LANG==='fr'?' j':'d')+'<", out)
         for old, new in EXTRA.get(rel, []):
             if old not in out:
                 raise SystemExit(f"pattern not found in {rel}: {old}")

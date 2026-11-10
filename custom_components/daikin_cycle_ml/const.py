@@ -3,7 +3,7 @@ from __future__ import annotations
 
 DOMAIN = "daikin_cycle_ml"
 NAME = "Daikin Cycle ML"
-VERSION = "1.22.0-fr.1"
+VERSION = "1.22.0-fr.2"
 
 # --- Coordinator ---
 UPDATE_INTERVAL_SECONDS = 30

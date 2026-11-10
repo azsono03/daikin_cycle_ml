@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.22.0-fr.2] - 2026-11-10 (fork azsono03)
+
+### Changed
+- Cards: remaining English labels translated (period tabs 7/15/30 j,
+  day spans, 365 j / semaine, bucket legend COURT / BON / LONG,
+  "7 derniers jours").
+
 ## [1.22.0-fr.1] - 2026-11-09 (fork azsono03)
 
 ### Fixed
